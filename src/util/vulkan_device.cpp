@@ -613,6 +613,7 @@ bool VulkanDevice::CreateDevice(VkPhysicalDevice physical_device, VkSurfaceKHR s
 
   // Grab the graphics and present queues.
   m_device = device;
+  vkGetPhysicalDeviceMemoryProperties(m_physical_device, &m_device_memory_properties);
   vkGetDeviceQueue(m_device, m_graphics_queue_family_index, 0, &m_graphics_queue);
   if (surface)
     vkGetDeviceQueue(m_device, m_present_queue_family_index, 0, &m_present_queue);
@@ -672,19 +673,16 @@ bool VulkanDevice::CreateAllocator()
   std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_size_limits;
   if (m_debug_device)
   {
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    vkGetPhysicalDeviceMemoryProperties(m_physical_device, &memory_properties);
-
     bool has_upload_heap = false;
     heap_size_limits.fill(VK_WHOLE_SIZE);
-    for (u32 i = 0; i < memory_properties.memoryTypeCount; i++)
+    for (u32 i = 0; i < m_device_memory_properties.memoryTypeCount; i++)
     {
       // Look for any memory types which are upload-like.
-      const VkMemoryType& type = memory_properties.memoryTypes[i];
+      const VkMemoryType& type = m_device_memory_properties.memoryTypes[i];
       if ((type.propertyFlags & UPLOAD_HEAP_PROPERTIES) != UPLOAD_HEAP_PROPERTIES)
         continue;
 
-      const VkMemoryHeap& heap = memory_properties.memoryHeaps[type.heapIndex];
+      const VkMemoryHeap& heap = m_device_memory_properties.memoryHeaps[type.heapIndex];
       if (heap.size >= UPLOAD_HEAP_SIZE_THRESHOLD)
         continue;
 
@@ -2632,8 +2630,8 @@ void VulkanDevice::RenderBlankFrame(VulkanSwapChain* swap_chain)
 }
 
 bool VulkanDevice::TryImportHostMemory(void* data, size_t data_size, VkBufferUsageFlags buffer_usage,
-                                       VkDeviceMemory* out_memory, VkBuffer* out_buffer, VkDeviceSize* out_offset,
-                                       Error* error)
+                                       u32* out_memory_type_index, VkDeviceMemory* out_memory, VkBuffer* out_buffer,
+                                       VkDeviceSize* out_offset, Error* error)
 {
   if (!m_optional_extensions.vk_ext_external_memory_host)
   {
@@ -2715,6 +2713,7 @@ bool VulkanDevice::TryImportHostMemory(void* data, size_t data_size, VkBufferUsa
 
   vkBindBufferMemory(m_device, imported_buffer, imported_memory, 0);
 
+  *out_memory_type_index = memory_index;
   *out_memory = imported_memory;
   *out_buffer = imported_buffer;
   *out_offset = data_offset;

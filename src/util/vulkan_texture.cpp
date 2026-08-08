@@ -983,9 +983,9 @@ std::unique_ptr<GPUTextureBuffer> VulkanDevice::CreateTextureBuffer(GPUTextureBu
 
 VulkanDownloadTexture::VulkanDownloadTexture(u32 width, u32 height, GPUTextureFormat format, VmaAllocation allocation,
                                              VkDeviceMemory memory, VkBuffer buffer, VkDeviceSize memory_offset,
-                                             const u8* map_ptr, u32 map_pitch)
+                                             const u8* map_ptr, u32 map_pitch, bool is_non_coherent)
   : GPUDownloadTexture(width, height, format, (memory != VK_NULL_HANDLE)), m_allocation(allocation), m_memory(memory),
-    m_buffer(buffer), m_memory_offset(memory_offset)
+    m_buffer(buffer), m_memory_offset(memory_offset), m_is_non_coherent(is_non_coherent)
 {
   m_map_pointer = map_ptr;
   m_current_pitch = map_pitch;
@@ -1018,6 +1018,7 @@ std::unique_ptr<VulkanDownloadTexture> VulkanDownloadTexture::Create(u32 width, 
   const u8* map_ptr = nullptr;
   u32 map_pitch = 0;
   u32 buffer_size = 0;
+  u32 memory_type_index = 0;
 
   // not importing memory?
   if (!memory)
@@ -1049,6 +1050,7 @@ std::unique_ptr<VulkanDownloadTexture> VulkanDownloadTexture::Create(u32 width, 
 
     DebugAssert(ai.pMappedData);
     map_ptr = static_cast<u8*>(ai.pMappedData);
+    memory_type_index = ai.memoryType;
   }
   else
   {
@@ -1056,8 +1058,8 @@ std::unique_ptr<VulkanDownloadTexture> VulkanDownloadTexture::Create(u32 width, 
     buffer_size = height * map_pitch;
     Assert(buffer_size <= memory_size);
 
-    if (!dev.TryImportHostMemory(memory, memory_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dev_memory, &buffer,
-                                 &memory_offset, error))
+    if (!dev.TryImportHostMemory(memory, memory_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &memory_type_index, &dev_memory,
+                                 &buffer, &memory_offset, error))
     {
       return {};
     }
@@ -1065,8 +1067,10 @@ std::unique_ptr<VulkanDownloadTexture> VulkanDownloadTexture::Create(u32 width, 
     map_ptr = static_cast<u8*>(memory);
   }
 
-  return std::unique_ptr<VulkanDownloadTexture>(new VulkanDownloadTexture(width, height, format, allocation, dev_memory,
-                                                                          buffer, memory_offset, map_ptr, map_pitch));
+  const bool is_non_coherent = (dev.m_device_memory_properties.memoryTypes[memory_type_index].propertyFlags &
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+  return std::unique_ptr<VulkanDownloadTexture>(new VulkanDownloadTexture(
+    width, height, format, allocation, dev_memory, buffer, memory_offset, map_ptr, map_pitch, is_non_coherent));
 }
 
 void VulkanDownloadTexture::CopyFromTexture(u32 dst_x, u32 dst_y, GPUTexture* src, u32 src_x, u32 src_y, u32 width,
@@ -1136,7 +1140,7 @@ void VulkanDownloadTexture::CopyFromTexture(u32 dst_x, u32 dst_y, GPUTexture* sr
     vkTex->TransitionSubresourcesToLayout(cmdbuf, 0, 1, src_level, 1, VulkanTexture::Layout::TransferSrc, old_layout);
 
   m_copy_fence_counter = dev.GetCurrentFenceCounter();
-  m_needs_cache_invalidate = true;
+  m_needs_cache_invalidate = m_is_non_coherent;
   m_needs_flush = true;
 }
 
@@ -1145,11 +1149,24 @@ bool VulkanDownloadTexture::Map(u32 x, u32 y, u32 width, u32 height)
   // Always mapped, but we might need to invalidate the cache.
   if (m_needs_cache_invalidate)
   {
-    u32 copy_offset, copy_size, copy_rows;
-    GetTransferSize(x, y, width, height, m_current_pitch, &copy_offset, &copy_size, &copy_rows);
-    vmaInvalidateAllocation(VulkanDevice::GetInstance().GetAllocator(), m_allocation, copy_offset,
-                            m_current_pitch * copy_rows);
     m_needs_cache_invalidate = false;
+
+    u32 copy_offset, copy_row_size, copy_rows;
+    GetTransferSize(x, y, width, height, m_current_pitch, &copy_offset, &copy_row_size, &copy_rows);
+
+    DebugAssert(copy_rows > 0);
+    const VkDeviceSize invalidate_size = copy_row_size + ((copy_rows - 1) * static_cast<VkDeviceSize>(m_current_pitch));
+
+    if (m_allocation != VK_NULL_HANDLE)
+    {
+      vmaInvalidateAllocation(VulkanDevice::GetInstance().GetAllocator(), m_allocation, copy_offset, invalidate_size);
+    }
+    else
+    {
+      const VkMappedMemoryRange range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, nullptr, m_memory, copy_offset,
+                                         invalidate_size};
+      vkInvalidateMappedMemoryRanges(VulkanDevice::GetInstance().GetVulkanDevice(), 1, &range);
+    }
   }
 
   return true;

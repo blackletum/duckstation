@@ -336,8 +336,8 @@ private:
 
   void RenderBlankFrame(VulkanSwapChain* swap_chain);
 
-  bool TryImportHostMemory(void* data, size_t data_size, VkBufferUsageFlags buffer_usage, VkDeviceMemory* out_memory,
-                           VkBuffer* out_buffer, VkDeviceSize* out_offset, Error* error);
+  bool TryImportHostMemory(void* data, size_t data_size, VkBufferUsageFlags buffer_usage, u32* out_memory_type_index,
+                           VkDeviceMemory* out_memory, VkBuffer* out_buffer, VkDeviceSize* out_offset, Error* error);
 
   /// Set dirty flags on everything to force re-bind at next draw time.
   void InvalidateCachedState();
@@ -443,4 +443,5 @@ private:
   VkPhysicalDevice m_physical_device = VK_NULL_HANDLE;
   VkPhysicalDeviceProperties m_device_properties = {};
   VkPhysicalDeviceDriverProperties m_device_driver_properties = {};
+  VkPhysicalDeviceMemoryProperties m_device_memory_properties = {};
 };
