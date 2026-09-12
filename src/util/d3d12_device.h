@@ -207,6 +207,8 @@ protected:
                                     std::optional<bool> exclusive_fullscreen_control, Error* error) override;
   void DestroyDevice() override;
 
+  u16 GetShaderCacheVersion() const;
+
   bool ReadPipelineCache(DynamicHeapArray<u8> data, Error* error) override;
   bool CreatePipelineCache(const std::string& path, Error* error) override;
   bool GetPipelineCacheData(DynamicHeapArray<u8>* data, Error* error) override;

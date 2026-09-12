@@ -417,6 +417,15 @@ void MetalDevice::SetFeatures(CreateFlags create_flags)
     !HasCreateFlag(create_flags, CreateFlags::DisableCompressedTextures) && m_device.supportsBCTextureCompression;
 }
 
+u16 VulkanDevice::GetShaderCacheVersion() const
+{
+  // Incorporate feature bits into the archive version so that device capability changes don't load the wrong shaders.
+  const bool barriers = (!m_features.framebuffer_fetch && m_features.feedback_loops);
+  return Truncate16(m_render_api_version) | (BoolToUInt16(m_features.dual_source_blend) << 15) |
+         (BoolToUInt16(m_features.framebuffer_fetch) << 14) | (BoolToUInt16(m_features.texture_buffers) << 13) |
+         (BoolToUInt16(barriers) << 12);
+}
+
 bool MetalDevice::LoadShaders(Error* error)
 {
   @autoreleasepool
