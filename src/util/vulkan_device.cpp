@@ -342,6 +342,8 @@ bool VulkanDevice::EnableOptionalDeviceExtensions(VkPhysicalDevice physical_devi
   if (m_device_properties.apiVersion >= VK_API_VERSION_1_1)
   {
     m_optional_extensions.vk_ext_memory_budget = SupportsAndAddExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    m_optional_extensions.vk_ext_pipeline_creation_cache_control =
+      SupportsAndAddExtension(VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME);
     m_optional_extensions.vk_khr_driver_properties = SupportsAndAddExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
 
     // glslang generates debug info instructions before phi nodes at the beginning of blocks when non-semantic debug
@@ -412,6 +414,7 @@ bool VulkanDevice::EnableOptionalDeviceExtensions(VkPhysicalDevice physical_devi
   LOG_EXT("VK_EXT_external_memory_host", vk_ext_external_memory_host);
   LOG_EXT("VK_EXT_fragment_shader_interlock", vk_ext_fragment_shader_interlock);
   LOG_EXT("VK_EXT_memory_budget", vk_ext_memory_budget);
+  LOG_EXT("VK_EXT_pipeline_creation_cache_control", vk_ext_pipeline_creation_cache_control);
   LOG_EXT("VK_EXT_rasterization_order_attachment_access", vk_ext_rasterization_order_attachment_access);
   LOG_EXT("VK_KHR_driver_properties", vk_khr_driver_properties);
   LOG_EXT("VK_KHR_dynamic_rendering", vk_khr_dynamic_rendering);
@@ -936,8 +939,17 @@ VkRenderPass VulkanDevice::GetRenderPass(const GPUPipeline::GraphicsConfig& conf
   key.samples = config.rasterization.multisamples;
   key.feedback_loop = config.render_pass_flags;
 
+  m_render_pass_cache_mutex.lock_shared();
   const auto it = m_render_pass_cache.find(key);
-  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
+  if (it != m_render_pass_cache.end())
+  {
+    const VkRenderPass ret = it->second;
+    m_render_pass_cache_mutex.unlock_shared();
+    return ret;
+  }
+
+  m_render_pass_cache_mutex.unlock_shared();
+  return CreateCachedRenderPass(key);
 }
 
 VkRenderPass VulkanDevice::GetRenderPass(VulkanTexture* const* rts, u32 num_rts, VulkanTexture* ds,
@@ -972,8 +984,17 @@ VkRenderPass VulkanDevice::GetRenderPass(VulkanTexture* const* rts, u32 num_rts,
 
   key.feedback_loop = feedback_loop;
 
+  m_render_pass_cache_mutex.lock_shared();
   const auto it = m_render_pass_cache.find(key);
-  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
+  if (it != m_render_pass_cache.end())
+  {
+    const VkRenderPass ret = it->second;
+    m_render_pass_cache_mutex.unlock_shared();
+    return ret;
+  }
+
+  m_render_pass_cache_mutex.unlock_shared();
+  return CreateCachedRenderPass(key);
 }
 
 VkRenderPass VulkanDevice::GetSwapChainRenderPass(GPUTextureFormat format, VkAttachmentLoadOp load_op)
@@ -988,12 +1009,22 @@ VkRenderPass VulkanDevice::GetSwapChainRenderPass(GPUTextureFormat format, VkAtt
   key.color[0].store_op = VK_ATTACHMENT_STORE_OP_STORE;
   key.samples = 1;
 
+  m_render_pass_cache_mutex.lock_shared();
   const auto it = m_render_pass_cache.find(key);
-  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
+  if (it != m_render_pass_cache.end())
+  {
+    const VkRenderPass ret = it->second;
+    m_render_pass_cache_mutex.unlock_shared();
+    return ret;
+  }
+
+  m_render_pass_cache_mutex.unlock_shared();
+  return CreateCachedRenderPass(key);
 }
 
 VkRenderPass VulkanDevice::GetRenderPassForRestarting(VkRenderPass pass)
 {
+  m_render_pass_cache_mutex.lock_shared();
   for (const auto& it : m_render_pass_cache)
   {
     if (it.second != pass)
@@ -1012,15 +1043,24 @@ VkRenderPass VulkanDevice::GetRenderPassForRestarting(VkRenderPass pass)
       modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 
     if (modified_key == it.first)
+    {
+      m_render_pass_cache_mutex.unlock_shared();
       return pass;
+    }
 
     auto fit = m_render_pass_cache.find(modified_key);
     if (fit != m_render_pass_cache.end())
-      return fit->second;
+    {
+      const VkRenderPass ret = fit->second;
+      m_render_pass_cache_mutex.unlock_shared();
+      return ret;
+    }
 
+    m_render_pass_cache_mutex.unlock_shared();
     return CreateCachedRenderPass(modified_key);
   }
 
+  m_render_pass_cache_mutex.unlock_shared();
   return pass;
 }
 
