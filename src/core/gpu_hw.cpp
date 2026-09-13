@@ -30,6 +30,7 @@
 #include "common/log.h"
 #include "common/scoped_guard.h"
 #include "common/string_util.h"
+#include "common/task_queue.h"
 #include "common/timer.h"
 
 #include "IconsEmoji.h"
@@ -199,44 +200,18 @@ namespace {
 class ShaderCompileProgressTracker
 {
 public:
-  ShaderCompileProgressTracker(u32 total)
-    : m_image(System::GetImageForLoadingScreen(VideoThread::GetGamePath())),
-      m_min_time(Timer::ConvertSecondsToValue(1.0)), m_update_interval(Timer::ConvertSecondsToValue(0.1)),
-      m_start_time(Timer::GetCurrentValue()), m_last_update_time(0), m_progress(0), m_total(total)
-  {
-  }
-  ~ShaderCompileProgressTracker() = default;
+  ShaderCompileProgressTracker(u32 total);
+  ~ShaderCompileProgressTracker();
 
-  double GetElapsedMilliseconds() const
-  {
-    return Timer::ConvertValueToMilliseconds(Timer::GetCurrentValue() - m_start_time);
-  }
-
-  bool Increment(u32 progress, Error* error)
-  {
-    m_progress += progress;
-
-    if (System::IsStartupCancelled())
-    {
-      Error::SetStringView(error, TRANSLATE_SV("System", "Startup was cancelled."));
-      ERROR_LOG("Shader compilation aborted due to cancelled startup");
-      return false;
-    }
-
-    const u64 tv = Timer::GetCurrentValue();
-    if ((tv - m_start_time) >= m_min_time && (tv - m_last_update_time) >= m_update_interval)
-    {
-      FullscreenUI::RenderLoadingScreen(
-        m_image, TRANSLATE_SV("GPU_HW", "Compiling Shaders..."),
-        SmallString::from_format(TRANSLATE_FS("GPU_HW", "{} of {} pipelines"), m_progress, m_total), 0,
-        static_cast<int>(m_total), static_cast<int>(m_progress));
-      m_last_update_time = tv;
-    }
-
-    return true;
-  }
+  double GetElapsedMilliseconds() const;
+  bool Increment(u32 progress, Error* error);
+  bool CompileShader(std::unique_ptr<GPUShader>* dest, const GPUShaderCacheKey& key, std::string source, Error* error);
+  bool WaitForCompletion(Error* error);
 
 private:
+  void EnsureTaskQueueCreated();
+  bool ConsumeCompletedTasks(Error* error);
+
   std::string m_image;
   Timer::Value m_min_time;
   Timer::Value m_update_interval;
@@ -244,7 +219,15 @@ private:
   Timer::Value m_last_update_time;
   u32 m_progress;
   u32 m_total;
+
+  std::optional<TaskQueue> m_task_queue;
+  s32 m_tasks_remaining = 0;
+
+  // False sharing on these, meh, whatever.
+  std::atomic_int32_t m_tasks_completed{0};
+  std::atomic_flag m_tasks_abort = ATOMIC_FLAG_INIT;
 };
+
 } // namespace
 
 GPU_HW::GPU_HW() : GPUBackend()
@@ -1099,6 +1082,139 @@ void GPU_HW::DestroyBuffers()
   g_gpu_device->RecycleTexture(std::move(m_vram_readback_texture));
 }
 
+ShaderCompileProgressTracker::ShaderCompileProgressTracker(u32 total)
+  : m_image(System::GetImageForLoadingScreen(VideoThread::GetGamePath())),
+    m_min_time(Timer::ConvertSecondsToValue(1.0)), m_update_interval(Timer::ConvertSecondsToValue(0.1)),
+    m_start_time(Timer::GetCurrentValue()), m_last_update_time(0), m_progress(0), m_total(total)
+{
+}
+
+ShaderCompileProgressTracker::~ShaderCompileProgressTracker() = default;
+
+double ShaderCompileProgressTracker::GetElapsedMilliseconds() const
+{
+  return Timer::ConvertValueToMilliseconds(Timer::GetCurrentValue() - m_start_time);
+}
+
+bool ShaderCompileProgressTracker::Increment(u32 progress, Error* error)
+{
+  m_progress += progress;
+
+  if (System::IsStartupCancelled())
+  {
+    Error::SetStringView(error, TRANSLATE_SV("System", "Startup was cancelled."));
+    ERROR_LOG("Shader compilation aborted due to cancelled startup");
+    return false;
+  }
+
+  const u64 tv = Timer::GetCurrentValue();
+  if ((tv - m_start_time) >= m_min_time && (tv - m_last_update_time) >= m_update_interval)
+  {
+    FullscreenUI::RenderLoadingScreen(
+      m_image, TRANSLATE_SV("GPU_HW", "Compiling Shaders..."),
+      SmallString::from_format(TRANSLATE_FS("GPU_HW", "{} of {} pipelines"), m_progress, m_total), 0,
+      static_cast<int>(m_total), static_cast<int>(m_progress));
+    m_last_update_time = tv;
+  }
+
+  return true;
+}
+
+bool ShaderCompileProgressTracker::CompileShader(std::unique_ptr<GPUShader>* dest, const GPUShaderCacheKey& key,
+                                                 std::string source, Error* error)
+{
+  if (!g_gpu_device->GetFeatures().thread_safe_shader_compile)
+  {
+    if (!(*dest = g_gpu_device->CompileShader(key, source, error)))
+      return false;
+
+    return Increment(1, error);
+  }
+
+  EnsureTaskQueueCreated();
+
+  // Have we previously aborted? Don't enqueue if so.
+  if (!ConsumeCompletedTasks(error))
+    return false;
+
+  m_tasks_remaining++;
+  m_task_queue->SubmitTask([this, dest, key, source = std::move(source)]() {
+    // bail out on error
+    if (m_tasks_abort.test(std::memory_order_acquire))
+      return;
+
+    Error error;
+    if ((*dest = g_gpu_device->CompileShader(key, source, &error)))
+    {
+      m_tasks_completed.fetch_add(1, std::memory_order_acq_rel);
+    }
+    else
+    {
+      ERROR_LOG("Failed to compile {} shader: {}", GPUShader::GetStageName(key.stage), error.GetDescription());
+      m_tasks_abort.test_and_set(std::memory_order_acq_rel);
+    }
+  });
+
+  return true;
+}
+
+bool ShaderCompileProgressTracker::WaitForCompletion(Error* error)
+{
+  if (!m_task_queue.has_value())
+    return true;
+
+  for (;;)
+  {
+    if (!ConsumeCompletedTasks(error))
+    {
+      // still need to wait for the workers to finish
+      m_task_queue->WaitForAll();
+      return false;
+    }
+
+    if (m_tasks_remaining <= 0)
+      break;
+
+    // do one on ourselves while we're sitting around waiting
+    // if we're just waiting for someone else to finish, don't spam updates
+    if (!m_task_queue->ExecuteOneTask())
+      VideoPresenter::ThrottlePresentation();
+  }
+
+  Assert(m_tasks_remaining == 0);
+  return true;
+}
+
+void ShaderCompileProgressTracker::EnsureTaskQueueCreated()
+{
+  static constexpr u32 MAX_WORKERS = 16;
+
+  if (m_task_queue.has_value())
+    return;
+
+  // We consider ourself to be a worker.
+  const u32 num_workers = std::clamp(Threading::GetProcessorCount(), 1u, MAX_WORKERS) - 1u;
+  m_task_queue.emplace();
+  m_task_queue->SetWorkerCount(num_workers);
+}
+
+bool ShaderCompileProgressTracker::ConsumeCompletedTasks(Error* error)
+{
+  if (m_tasks_abort.test(std::memory_order_acquire)) [[unlikely]]
+  {
+    Error::SetStringView(error, "One or more shaders failed to compile.");
+    return false;
+  }
+
+  const s32 done = m_tasks_completed.load(std::memory_order_acquire);
+  if (done == 0)
+    return true;
+
+  m_tasks_completed.fetch_sub(done, std::memory_order_acq_rel);
+  m_tasks_remaining -= done;
+  return Increment(done, error);
+}
+
 bool GPU_HW::CompileCommonShaders(Error* error)
 {
   const GPU_HW_ShaderGen shadergen(g_gpu_device->GetRenderAPI(), m_supports_dual_source_blend,
@@ -1258,15 +1374,19 @@ bool GPU_HW::CompilePipelines(Error* error)
         const GPUShaderCacheKey key =
           GPUDevice::GetShaderCacheKey(GPUShaderStage::Vertex, shadergen.GetLanguage(),
                                        static_cast<u16>(ShaderCacheKeyType::HWBatchVertex), &vssel, sizeof(vssel));
-        if (!(batch_vertex_shaders[textured][palette][sprite] = g_gpu_device->LoadShader(key)) &&
-            !(batch_vertex_shaders[textured][palette][sprite] =
-                g_gpu_device->CompileShader(key, shadergen.GenerateBatchVertexShader(vssel), error)))
+        if (!(batch_vertex_shaders[textured][palette][sprite] = g_gpu_device->LoadShader(key)))
         {
-          return false;
+          if (!progress.CompileShader(&batch_vertex_shaders[textured][palette][sprite], key,
+                                      shadergen.GenerateBatchVertexShader(vssel), error)) [[unlikely]]
+          {
+            return false;
+          }
         }
-
-        if (!progress.Increment(1, error)) [[unlikely]]
-          return false;
+        else
+        {
+          if (!progress.Increment(1, error)) [[unlikely]]
+            return false;
+        }
       }
     }
   }
@@ -1378,16 +1498,20 @@ bool GPU_HW::CompilePipelines(Error* error)
                   static_cast<u16>(ShaderCacheKeyType::HWBatchFragment), &fssel, sizeof(fssel));
 
                 if (!(batch_fragment_shaders[depth_test][render_mode][transparency_mode][texture_mode][check_mask]
-                                            [dithering][interlacing] = g_gpu_device->LoadShader(key)) &&
-                    !(batch_fragment_shaders[depth_test][render_mode][transparency_mode][texture_mode][check_mask]
-                                            [dithering][interlacing] = g_gpu_device->CompileShader(
-                                              key, shadergen.GenerateBatchFragmentShader(fssel), error)))
+                                            [dithering][interlacing] = g_gpu_device->LoadShader(key)))
                 {
-                  return false;
+                  if (!progress.CompileShader(&batch_fragment_shaders[depth_test][render_mode][transparency_mode]
+                                                                     [texture_mode][check_mask][dithering][interlacing],
+                                              key, shadergen.GenerateBatchFragmentShader(fssel), error)) [[unlikely]]
+                  {
+                    return false;
+                  }
                 }
-
-                if (!progress.Increment(1, error)) [[unlikely]]
-                  return false;
+                else
+                {
+                  if (!progress.Increment(1, error)) [[unlikely]]
+                    return false;
+                }
               }
             }
           }
@@ -1395,6 +1519,9 @@ bool GPU_HW::CompilePipelines(Error* error)
       }
     }
   }
+
+  if (!progress.WaitForCompletion(error))
+    return false;
 
   static constexpr GPUPipeline::VertexAttribute vertex_attributes[] = {
     GPUPipeline::VertexAttribute::Make(0, GPUPipeline::VertexAttribute::Semantic::Position, 0,
