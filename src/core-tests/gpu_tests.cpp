@@ -3,12 +3,14 @@
 
 #include "core/cpu_core.h"
 #include "core/gpu.h"
+#include "core/gpu_sw_rasterizer.h"
 #include "core/interrupt_controller.h"
 #include "core/settings.h"
 #include "core/timing_event.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 
 namespace {
@@ -184,4 +186,51 @@ TEST(GPUDisplay, ExcessiveFineCropProducesEmptyBoundedRectangles)
     EXPECT_GT(display.width(), 0);
     EXPECT_GT(display.height(), 0);
   }
+}
+
+TEST(GPURasterizer, V2RectangleFlipsWrapBeforeApplyingTextureWindow)
+{
+  GPU_SW_Rasterizer::SelectImplementation();
+  const GPUDrawingArea old_area = GPU_SW_Rasterizer::g_drawing_area;
+  GPU_SW_Rasterizer::g_drawing_area = {515, 301, 808, 303};
+
+  for (u16 flip_bits : {u16(0), u16(1u << 12), u16(1u << 13), u16(3u << 12)})
+  {
+    std::fill_n(g_vram, VRAM_WIDTH * VRAM_HEIGHT, 0);
+    for (u32 y = 0; y < 256; y++)
+    {
+      for (u32 x = 0; x < 256; x++)
+        g_vram[y * VRAM_WIDTH + x] = static_cast<u16>(1 + ((y * 256 + x) % 32767));
+    }
+
+    GPUBackendDrawRectangleCommand cmd = {};
+    cmd.texture_enable = true;
+    cmd.raw_texture_enable = true;
+    cmd.draw_mode.bits = flip_bits;
+    cmd.draw_mode.texture_mode = GPUTextureMode::Direct16Bit;
+    cmd.window = {.and_x = 0xEF, .and_y = 0xF7, .or_x = 0x10, .or_y = 0x08};
+    cmd.x = 512;
+    cmd.y = 300;
+    cmd.width = 300;
+    cmd.height = 5;
+    cmd.texcoord = 0x0101;
+
+    GPU_SW_Rasterizer::GetDrawRectangleFunction(GPU_SW_Rasterizer::TextureModulationMode::NoModulation, false)(&cmd);
+    for (u32 y = 0; y < cmd.height; y++)
+    {
+      for (u32 x = 0; x < cmd.width; x++)
+      {
+        u16 expected = 0;
+        if ((cmd.x + x) >= 515 && (cmd.x + x) <= 808 && (cmd.y + y) >= 301 && (cmd.y + y) <= 303)
+        {
+          const u32 u = (((1 + ((flip_bits & (1u << 12)) ? -x : x)) & 0xFF) & cmd.window.and_x) | cmd.window.or_x;
+          const u32 v = (((1 + ((flip_bits & (1u << 13)) ? -y : y)) & 0xFF) & cmd.window.and_y) | cmd.window.or_y;
+          expected = g_vram[v * VRAM_WIDTH + u];
+        }
+        EXPECT_EQ(g_vram[(cmd.y + y) * VRAM_WIDTH + cmd.x + x], expected)
+          << "flip_bits=" << flip_bits << ", x=" << x << ", y=" << y;
+      }
+    }
+  }
+  GPU_SW_Rasterizer::g_drawing_area = old_area;
 }

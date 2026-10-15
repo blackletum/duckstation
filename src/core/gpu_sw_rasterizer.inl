@@ -260,7 +260,8 @@ static void DrawRectangle(const GPUBackendDrawRectangleCommand* cmd)
     }
 
     const u32 draw_y = static_cast<u32>(y) & VRAM_HEIGHT_MASK;
-    const u8 texcoord_y = Truncate8(ZeroExtend32(origin_texcoord_y) + offset_y);
+    const u8 texcoord_y =
+      Truncate8(ZeroExtend32(origin_texcoord_y) + (cmd->draw_mode.texture_y_flip ? -offset_y : offset_y));
 
     for (u32 offset_x = 0; offset_x < cmd->width; offset_x++)
     {
@@ -268,7 +269,8 @@ static void DrawRectangle(const GPUBackendDrawRectangleCommand* cmd)
       if (x < static_cast<s32>(g_drawing_area.left) || x > static_cast<s32>(g_drawing_area.right))
         continue;
 
-      const u8 texcoord_x = Truncate8(ZeroExtend32(origin_texcoord_x) + offset_x);
+      const u8 texcoord_x =
+        Truncate8(ZeroExtend32(origin_texcoord_x) + (cmd->draw_mode.texture_x_flip ? -offset_x : offset_x));
 
       ShadePixel<modulation_mode, transparency_enable>(cmd, static_cast<u32>(x), draw_y, r, g, b, texcoord_x,
                                                        texcoord_y);
@@ -816,7 +818,12 @@ static void DrawRectangle(const GPUBackendDrawRectangleCommand* RESTRICT cmd)
   const GSVectorNi rg = GSVectorNi::broadcast128(rgp.u8to16()); // R0G0 | R0G0 | R0G0 | R0G0
   const GSVectorNi ba = GSVectorNi::broadcast128(bap.u8to16()); // B0A0 | B0A0 | B0A0 | B0A0
 
-  const GSVectorNi texcoord_x = GSVectorNi(cmd->texcoord & 0xFF).add32(SPAN_OFFSET_VEC);
+  const GSVectorNi x_step =
+    cmd->draw_mode.texture_x_flip ? GSVectorNi::zero().sub32(PIXELS_PER_VEC_VEC) : PIXELS_PER_VEC_VEC;
+  const GSVectorNi y_step = GSVectorNi(cmd->draw_mode.texture_y_flip ? -1 : 1);
+  const GSVectorNi texcoord_x = cmd->draw_mode.texture_x_flip ?
+                                  GSVectorNi(cmd->texcoord & 0xFF).sub32(SPAN_OFFSET_VEC) :
+                                  GSVectorNi(cmd->texcoord & 0xFF).add32(SPAN_OFFSET_VEC);
   GSVectorNi texcoord_y = GSVectorNi(cmd->texcoord >> 8);
 
   const PixelVectors<texture_enable> pv(cmd);
@@ -900,12 +907,12 @@ static void DrawRectangle(const GPUBackendDrawRectangleCommand* RESTRICT cmd)
         wvec = wvec.sub32(PIXELS_PER_VEC_VEC);
 
         if constexpr (texture_enable)
-          row_texcoord_x = row_texcoord_x.add32(PIXELS_PER_VEC_VEC) & GSVectorNi::cxpr(0xFF);
+          row_texcoord_x = row_texcoord_x.add32(x_step) & GSVectorNi::cxpr(0xFF);
       }
     }
 
     if constexpr (texture_enable)
-      texcoord_y = texcoord_y.add32(GSVectorNi::cxpr(1)) & GSVectorNi::cxpr(0xFF);
+      texcoord_y = texcoord_y.add32(y_step) & GSVectorNi::cxpr(0xFF);
   }
 
 #ifdef CHECK_VECTOR
