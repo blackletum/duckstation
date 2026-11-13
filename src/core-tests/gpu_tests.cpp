@@ -442,6 +442,24 @@ static void RunGPUTicks(TickCount ticks)
   }
 }
 
+// In 240p, GPUSTAT.31 is the parity of the displayed VRAM row, counting from Y at Y1, and the parity of Y in vblank.
+// GP1(05h) needs the video thread, so this only covers Y = 0.
+TEST_F(GPUFrontend, ProgressiveLineBitIsTheDisplayedRowParity)
+{
+  GPU::WriteRegister(4, 0x07000000 | 0x11 | (0xC8 << 10)); // Y1 = 17, Y2 = 200
+  for (u32 line = 1; line < 30; line++)
+  {
+    SCOPED_TRACE(line);
+    u32 tick, current_line;
+    do
+    {
+      RunGPUTicks(64);
+      GPU::GetBeamPosition(&tick, &current_line);
+    } while (current_line != line);
+    EXPECT_EQ(GPU::ReadRegister(4) >> 31, (line < 0x11) ? 0u : ((line - 0x11) & 1u));
+  }
+}
+
 // Returns the hblanks until GPUSTAT.13 next changes, at the start of the last line of the field, and whether it fell.
 // Gives up after the longest possible field, so a stuck field fails instead of hanging.
 static std::pair<u32, bool> RunToFieldBitChange()
