@@ -541,6 +541,46 @@ TEST_F(GPUFrontend, ProgressiveFramesHoldTheInterlacedField)
   }
 }
 
+// The next field is chosen in scanline 311, a line before GPUSTAT.13 changes in a long field. Interlace turned off in
+// the long field before that holds the long field, and from there it holds the short field that follows.
+TEST_F(GPUFrontend, InterlaceOffInTheLongFieldsSecondLastLineHoldsTheNextField)
+{
+  const Settings old_settings = g_settings;
+  g_settings.display_deinterlacing_mode = DisplayDeinterlacingMode::Progressive; // No display clear on interlace.
+  GPU::UpdateSettings(old_settings);
+  GPU::WriteRegister(4, 0x08000028);
+  GPU::WriteRegister(4, 0x07000000 | 0x125 | (0x125 << 10)); // Y1 == Y2 stays in vblank.
+  Timers::WriteRegister(0x14, 0x0100);                       // hblank clock
+
+  for (const u32 off_line : {310u, 311u})
+  {
+    SCOPED_TRACE(off_line);
+
+    // GPUSTAT.13 reads 1 in the long field, until its last line.
+    RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 100));
+    while ((GPU::ReadRegister(4) & (1u << 13)) == 0)
+    {
+      RunGPUTicks(1000);
+      RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 100));
+    }
+
+    RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(1700, off_line));
+    GPU::WriteRegister(4, 0x08000008);
+    for (u32 i = 0; i < 3; i++)
+    {
+      RunGPUTicks(1000);
+      RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 100));
+    }
+    GPU::WriteRegister(4, 0x08000028);
+
+    // A held long field falls at its last line, 212 lines on, a held short field rises 211 lines on.
+    const auto [lines, fell] = RunToFieldBitChange();
+    const bool short_field = (off_line == 311);
+    EXPECT_EQ(lines, short_field ? 211u : 212u);
+    EXPECT_EQ(fell, !short_field);
+  }
+}
+
 // The line counter is 10 bits. In PAL, interlace turned off at line 309 and back on at 312 of a short field misses the
 // end of the field, and the counter runs on to 1023: with Y2=293 the vblank IRQ comes 1008 lines after the first
 // write. In a long field, line 312 is still part of the field.

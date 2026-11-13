@@ -2334,6 +2334,16 @@ void GPU::WriteGP1(u32 value)
         static constexpr u32 SET_MASK = UINT32_C(0b00000000011111110100000000000000);
         s_locals.command_tick_event.InvokeEarlyNoReschedule();
         SynchronizeCRTC();
+
+        // The next field is chosen in scanline 311 (261 in NTSC), the last line of a short field and the line before
+        // the last of a long one, where bit 13 hasn't changed yet. Turning interlace off from there holds that field.
+        const CRTCState& cs = s_locals.crtc_state;
+        if (s_locals.GPUSTAT.vertical_interlace && !dm.vertical_interlace && cs.current_scanline < cs.vertical_total &&
+            cs.current_scanline >= (cs.vertical_total + cs.interlaced_field - 2u))
+        {
+          s_locals.GPUSTAT.interlaced_field = ConvertToBoolUnchecked(cs.interlaced_field);
+        }
+
         s_locals.GPUSTAT.bits = (s_locals.GPUSTAT.bits & ~SET_MASK) | (new_GPUSTAT.bits & SET_MASK);
         UpdateCRTCConfig();
       }
