@@ -581,10 +581,11 @@ TEST_F(GPUFrontend, InterlaceOffInTheLongFieldsSecondLastLineHoldsTheNextField)
   }
 }
 
-// The line counter is 10 bits. In PAL, interlace turned off at line 309 and back on at 312 of a short field misses the
-// end of the field, and the counter runs on to 1023: with Y2=293 the vblank IRQ comes 1008 lines after the first
-// write. In a long field, line 312 is still part of the field.
-TEST_F(GPUFrontend, InterlaceSwitchPastTheEndOfTheFieldRunsTheLineCounterOn)
+// Interlace turned off at PAL scanline 309 and back on at the start of a later line. On in or past the held field's
+// last line misses its end, and the 10-bit line counter runs on to 1024, (1024-309)+293 = 1008 lines to the IRQ.
+// On in the 240p frame's last line lets it finish at 314 lines instead, and before the held field's last line it ends
+// at the held field's length.
+TEST_F(GPUFrontend, InterlaceSwitchNearTheEndOfTheFieldRunsTheLineCounterOn)
 {
   const Settings old_settings = g_settings;
   g_settings.display_deinterlacing_mode = DisplayDeinterlacingMode::Progressive; // No display clear on interlace.
@@ -593,9 +594,16 @@ TEST_F(GPUFrontend, InterlaceSwitchPastTheEndOfTheFieldRunsTheLineCounterOn)
   GPU::WriteRegister(4, 0x07000000 | 0x125 | (0x125 << 10)); // Y1 == Y2 stays in vblank.
   Timers::WriteRegister(0x14, 0x0100);                       // hblank clock
 
-  for (const auto [short_field, expected_lines] : {std::pair<bool, u32>{true, 1008}, {false, 297}})
+  for (const auto [short_field, on_line, expected_lines] : {std::tuple<bool, u32, u32>{true, 310, 296},
+                                                            {true, 311, 1008},
+                                                            {true, 312, 1008},
+                                                            {true, 313, 298},
+                                                            {false, 311, 297},
+                                                            {false, 312, 1008},
+                                                            {false, 313, 298}})
   {
     SCOPED_TRACE(short_field);
+    SCOPED_TRACE(on_line);
 
     // GPUSTAT.13 reads 0 in the short field, until its last line.
     RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 100));
@@ -608,11 +616,11 @@ TEST_F(GPUFrontend, InterlaceSwitchPastTheEndOfTheFieldRunsTheLineCounterOn)
     RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 309));
     GPU::WriteRegister(4, 0x08000008);
     const u32 start = Timers::ReadRegister(0x10);
-    RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 312));
+    RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, on_line));
     GPU::WriteRegister(4, 0x08000028);
 
     u32 tick, line;
-    if (short_field)
+    if (expected_lines > 1000)
     {
       RunGPUTicks(GPU::GetSystemTicksUntilTicksAndLine(0, 1000));
       GPU::GetBeamPosition(&tick, &line);

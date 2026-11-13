@@ -326,6 +326,9 @@ struct CRTCState
   u8 interlaced_field;
   u8 interlaced_display_field;
 
+  /// Interlace was turned on after the field's end was decided, so the line counter runs on until it wraps.
+  bool frame_end_missed;
+
   /// 0 if the currently-displayed field is on an even line in VRAM, otherwise 1.
   u8 active_line_lsb;
 
@@ -693,6 +696,7 @@ void GPU::ResetCRTCTiming(bool was_in_hblank)
   cs.fractional_ticks = 0;
   cs.interlaced_field = 1;
   cs.interlaced_display_field = 0;
+  cs.frame_end_missed = false;
   s_locals.GPUSTAT.display_line_lsb = false;
 
   UpdateCRTCHBlankFlag();
@@ -784,6 +788,7 @@ bool GPU::DoState(StateWrapper& sw)
   sw.Do(&s_locals.crtc_state.interlaced_field);
   sw.Do(&s_locals.crtc_state.interlaced_display_field);
   sw.Do(&s_locals.crtc_state.active_line_lsb);
+  sw.DoEx(&s_locals.crtc_state.frame_end_missed, 100, false);
 
   sw.Do(&s_locals.blitter_state, BlitterState::DrawingPolyLine);
   sw.Do(&s_locals.pending_command_ticks);
@@ -1189,7 +1194,8 @@ u64 GPU::GetCRTCLineSubTicks()
 u64 GPU::GetCRTCFieldSubTicks()
 {
   const CRTCState& cs = s_locals.crtc_state;
-  return GetCRTCLineSubTicks() * ((cs.current_scanline < cs.vertical_total) ? cs.vertical_total : LINE_COUNTER_WRAP);
+  return GetCRTCLineSubTicks() *
+         ((cs.current_scanline < cs.vertical_total && !cs.frame_end_missed) ? cs.vertical_total : LINE_COUNTER_WRAP);
 }
 
 float GPU::ComputeHorizontalFrequency()
@@ -1432,10 +1438,20 @@ void GPU::UpdateCRTCConfig(u16 old_vram_width, u16 old_vram_height)
 
   // Switching between NTSC and PAL keeps the line within the field. Switching interlace leaves the line counter alone,
   // even if it is now past the end, and a line already past the end keeps running on until the counter wraps.
-  if (cs.current_scanline < old_vertical_total &&
+  if (cs.current_scanline < old_vertical_total && !cs.frame_end_missed &&
       (old_vertical_total > NTSC_TOTAL_LINES) != (cs.vertical_total > NTSC_TOTAL_LINES))
   {
     cs.current_scanline %= cs.vertical_total;
+  }
+  else if (cs.vertical_total < old_vertical_total && cs.current_scanline < old_vertical_total &&
+           cs.current_scanline >= (cs.vertical_total - 1u) && !cs.frame_end_missed)
+  {
+    // The field's end is decided at the start of its last line. Turning interlace on in or past the shorter field's
+    // last line misses it, unless the 240p frame's end was already decided in its own last line, then it finishes.
+    if (cs.current_scanline == (old_vertical_total - 1u))
+      cs.current_scanline = cs.vertical_total - 1u;
+    else
+      cs.frame_end_missed = (cs.current_scanline < cs.vertical_total);
   }
 
   System::SetVideoFrameRate(ComputeVerticalFrequency());
@@ -1705,7 +1721,8 @@ ALWAYS_INLINE_RELEASE TickCount GPU::GetPendingCommandTicks()
 ALWAYS_INLINE_RELEASE TickCount GPU::GetTicksUntilLine(u32 line)
 {
   const CRTCState& cs = s_locals.crtc_state;
-  const u32 wrap_line = (cs.current_scanline < cs.vertical_total) ? cs.vertical_total : LINE_COUNTER_WRAP;
+  const u32 wrap_line =
+    (cs.current_scanline < cs.vertical_total && !cs.frame_end_missed) ? cs.vertical_total : LINE_COUNTER_WRAP;
   line = line ? line : wrap_line;
   return static_cast<TickCount>((line > cs.current_scanline) ? (line - cs.current_scanline) :
                                                                (wrap_line - cs.current_scanline + line));
@@ -1923,7 +1940,8 @@ void GPU::CRTCTickEvent(void*, TickCount ticks)
   while (lines_to_draw > 0)
   {
     // A mode change can leave the line past the end of the field, it then runs on until the counter wraps.
-    const u32 wrap_line = (cs.current_scanline < cs.vertical_total) ? cs.vertical_total : LINE_COUNTER_WRAP;
+    const u32 wrap_line =
+      (cs.current_scanline < cs.vertical_total && !cs.frame_end_missed) ? cs.vertical_total : LINE_COUNTER_WRAP;
     const u32 lines_to_draw_this_loop = std::min(lines_to_draw, wrap_line - cs.current_scanline);
     const u32 prev_scanline = cs.current_scanline;
     cs.current_scanline = Truncate16(cs.current_scanline + lines_to_draw_this_loop);
@@ -1959,6 +1977,7 @@ void GPU::CRTCTickEvent(void*, TickCount ticks)
         cs.vertical_total = cs.vertical_total + cs.interlaced_field - new_field;
       cs.current_scanline = 0;
       cs.interlaced_field = new_field;
+      cs.frame_end_missed = false;
 
       // The display field is switched early at vblank start for drawing, but that may have been before the switch to
       // 480i, or vblank may not have started in this field.
@@ -2339,7 +2358,7 @@ void GPU::WriteGP1(u32 value)
         // the last of a long one, where bit 13 hasn't changed yet. Turning interlace off from there holds that field.
         const CRTCState& cs = s_locals.crtc_state;
         if (s_locals.GPUSTAT.vertical_interlace && !dm.vertical_interlace && cs.current_scanline < cs.vertical_total &&
-            cs.current_scanline >= (cs.vertical_total + cs.interlaced_field - 2u))
+            !cs.frame_end_missed && cs.current_scanline >= (cs.vertical_total + cs.interlaced_field - 2u))
         {
           s_locals.GPUSTAT.interlaced_field = ConvertToBoolUnchecked(cs.interlaced_field);
         }
